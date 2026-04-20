@@ -1,0 +1,4 @@
+# ninja log v7
+1	23495	1775532207379127774	/media/disk3/zhouyikang/pano-vlm/projects/llava_dino_m2f/models/ms_deform_attn/ops/build/temp.linux-x86_64-cpython-312/media/disk3/zhouyikang/pano-vlm/projects/llava_dino_m2f/models/ms_deform_attn/ops/src/cpu/ms_deform_attn_cpu.o	85f037f5fa108e67
+34	57768	1775532207415127290	/media/disk3/zhouyikang/pano-vlm/projects/llava_dino_m2f/models/ms_deform_attn/ops/build/temp.linux-x86_64-cpython-312/media/disk3/zhouyikang/pano-vlm/projects/llava_dino_m2f/models/ms_deform_attn/ops/src/vision.o	a75af5efc2b5a60c
+26	65955	1775532207407127397	/media/disk3/zhouyikang/pano-vlm/projects/llava_dino_m2f/models/ms_deform_attn/ops/build/temp.linux-x86_64-cpython-312/media/disk3/zhouyikang/pano-vlm/projects/llava_dino_m2f/models/ms_deform_attn/ops/src/cuda/ms_deform_attn_cuda.o	b8f665c0ba788890

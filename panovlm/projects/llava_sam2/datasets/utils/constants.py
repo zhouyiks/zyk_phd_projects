@@ -1,0 +1,13 @@
+IMG_CONTEXT_TOKEN = '<IMG_CONTEXT>'
+IMG_START_TOKEN = '<img>'
+IMG_END_TOKEN = '</img>'
+PHRASE_START_TOKEN = '<p>'
+PHRASE_END_TOKEN = '</p>'
+SEG_TOKEN = '[SEG{id}]'
+CLS_TOKEN = '[CLS]'
+BG_CLS_TOKEN = '[BG_CLS]'
+# PROPOSAL_TOKENS = [f'[SEG{str(i).zfill(3)}]' for i in range(300)]
+OBJ_START_TOKEN = '<obj>'
+OBJ_END_TOKEN = '</obj>'
+OBJ_CONTEXT_TOKEN = '<OBJ_CONTEXT>'
+DEFAULT_OBJ_TOKEN = '<obj_tokens>'
