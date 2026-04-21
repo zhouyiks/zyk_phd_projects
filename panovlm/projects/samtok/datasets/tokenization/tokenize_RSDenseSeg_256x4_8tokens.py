@@ -94,7 +94,7 @@ def main(task_id):
     CODEBOOK_SIZE = 256
     CODEBOOK_DEPTH = 4
     sam2_config = SAM2Config(
-        ckpt_path="pretrained_weights/sam2.1_hiera_large.pt",
+        ckpt_path="checkpoints/sam2.1_hiera_large.pt",
         num_mask_tokens=8,
         is_causal=True,
     )
@@ -108,7 +108,7 @@ def main(task_id):
     )
     vq_sam2 = VQ_SAM2(vq_sam2_config).cuda().eval()
 
-    state = torch.load("./checkpoints_extract/vq_sam2_256x8_8tokens_true_causal_attn.pth", map_location="cpu")
+    state = torch.load("./checkpoints/vq_sam2_256x8_8tokens_true_causal_attn.pth", map_location="cpu")
     vq_sam2.load_state_dict(state)
 
     sam2_image_processor = DirectResize(1024)
@@ -142,7 +142,7 @@ def main(task_id):
         if not os.path.exists(temp_save_root):
             os.makedirs(temp_save_root)
 
-    root_list = ['/media/disk3/dataset/zipped_formatted_datasets']
+    root_list = ['/data_16t/datasets/seg_data']
 
     for ds_idx, dataset_name in enumerate(dataset_list):
         print(f"==========>>>{ds_idx+1} / {len(dataset_list)} DATASET.")
@@ -177,7 +177,7 @@ def main(task_id):
                 if len(segmentation) > 1 and cls_name not in ins_cls_name:
                     ins_cls_name.append(cls_name)
 
-        chunk_size = (len(json_data)+1) // 2
+        chunk_size = (len(json_data)+3) // 4
         _start_ = task_id * chunk_size
         _end_ = _start_ + chunk_size
         _end_ = len(json_data) if _end_ > len(json_data) else _end_
