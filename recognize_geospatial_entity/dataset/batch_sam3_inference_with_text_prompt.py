@@ -2,13 +2,20 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
+from contextlib import nullcontext
 from itertools import count
 from pathlib import Path
 from typing import Iterator, Sequence
 
 import torch
 from PIL import Image
+try:
+    from tqdm.auto import tqdm
+except ImportError:
+    def tqdm(iterable, **kwargs):
+        return iterable
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -37,7 +44,7 @@ from sam3.train.transforms.basic_for_api import (
 
 
 """
-目标：给定固定的类别名称列表，预计包含300+种类别，实现批量文本提示 SAM3 推理。
+目标：给定固定的类别名称列表，包含23种类别，实现批量文本提示 SAM3 推理。
 
 实现说明：
 1. 按照 sam3_image_batched_inference.ipynb 的 Datapoint -> transform -> collate ->
@@ -47,7 +54,7 @@ from sam3.train.transforms.basic_for_api import (
 3. 每次取 BATCH_SIZE 个类别构建文本提示，对单张图像做一次批量推理。
 4. 每张图像输出一个同名 json 文件，内容格式为：
    {
-     "image_file": "image_name.jpg",
+     "image_file": "relative/path/to/image_name.jpg",
      "annotation": [
        {"class_name": "category_name#1", "segmentation": [rle#1, rle#2, ...]},
        {"class_name": "category_name#2", "segmentation": [rle#1, rle#2, ...]}
@@ -56,19 +63,20 @@ from sam3.train.transforms.basic_for_api import (
 
 注意：
 1. 当前脚本只完成流程框架搭建，不在此脚本内做验证或执行。
-2. 真正运行前，需要提供 checkpoint 或显式允许从 HuggingFace 下载权重。
+2. 真正运行前，需要提供用户本地已下载的 HuggingFace SAM3 权重目录或文件路径。
 """
 
 
 DEFAULT_BATCH_SIZE = 32
 DEFAULT_IMAGE_SIZE = 1008
-DEFAULT_DETECTION_THRESHOLD = 0.5
+DEFAULT_DETECTION_THRESHOLD = 0.4
 DEFAULT_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "sam3_batch_text_prompt_outputs"
-DEFAULT_CATEGORY_FILES = (
-    PROJECT_ROOT / "oes_geospatial_entity_category_en.json",
-    PROJECT_ROOT / "rsdenseseg_geospatial_entity_category_en.json",
-)
+DEFAULT_CATEGORY_FILE = PROJECT_ROOT / "sam3_geospatial_entity_category.json"
+DEFAULT_CATEGORY_FILES = (DEFAULT_CATEGORY_FILE,)
+NAIP_IMAGE_ROOT = Path("/media/disk5/dataset/satlas/dataset/naip")
+NAIP_IMAGE_INDEX_FILE = Path("/media/disk5/dataset/satlas/naip_images.json")
+SUPPORTED_CHECKPOINT_SUFFIXES = {".pt", ".pth", ".bin"}
 IMAGE_EXTENSIONS = {
     ".jpg",
     ".jpeg",
@@ -136,6 +144,57 @@ def iter_image_files(input_path: Path) -> Iterator[Path]:
             yield path
 
 
+def scan_image_files_fast(input_path: Path) -> list[Path]:
+    image_paths: list[str] = []
+    pending_dirs = [str(input_path)]
+
+    while pending_dirs:
+        current_dir = pending_dirs.pop()
+        with os.scandir(current_dir) as entries:
+            for entry in entries:
+                if entry.is_dir(follow_symlinks=False):
+                    pending_dirs.append(entry.path)
+                    continue
+
+                if (
+                    entry.is_file(follow_symlinks=False)
+                    and Path(entry.name).suffix.lower() in IMAGE_EXTENSIONS
+                ):
+                    image_paths.append(entry.path)
+
+    return [Path(path) for path in sorted(image_paths)]
+
+
+def load_or_create_naip_image_paths() -> list[Path]:
+    if NAIP_IMAGE_INDEX_FILE.exists():
+        with NAIP_IMAGE_INDEX_FILE.open("r", encoding="utf-8") as f:
+            cached_paths = json.load(f)
+
+        if not isinstance(cached_paths, list) or not all(
+            isinstance(path, str) for path in cached_paths
+        ):
+            raise ValueError(
+                f"NAIP image index must be a JSON list of strings: {NAIP_IMAGE_INDEX_FILE}"
+            )
+
+        return [Path(path) for path in cached_paths]
+
+    if not NAIP_IMAGE_ROOT.exists():
+        raise FileNotFoundError(f"NAIP image root does not exist: {NAIP_IMAGE_ROOT}")
+
+    image_paths = scan_image_files_fast(NAIP_IMAGE_ROOT)
+    NAIP_IMAGE_INDEX_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with NAIP_IMAGE_INDEX_FILE.open("w", encoding="utf-8") as f:
+        json.dump([str(path) for path in image_paths], f, ensure_ascii=False, indent=2)
+    return image_paths
+
+
+def resolve_image_paths(input_path: Path) -> list[Path]:
+    if input_path.is_dir() and input_path.resolve() == NAIP_IMAGE_ROOT.resolve():
+        return load_or_create_naip_image_paths()
+    return list(iter_image_files(input_path))
+
+
 def chunked(items: Sequence[str], chunk_size: int) -> Iterator[list[str]]:
     if chunk_size <= 0:
         raise ValueError("chunk_size must be a positive integer")
@@ -179,17 +238,59 @@ def build_postprocessor(
     )
 
 
+def build_inference_context(device: torch.device):
+    if device.type != "cuda":
+        return nullcontext()
+
+    amp_dtype = (
+        torch.bfloat16
+        if torch.cuda.is_bf16_supported()
+        else torch.float16
+    )
+    return torch.autocast(device_type="cuda", dtype=amp_dtype)
+
+
+def resolve_hf_checkpoint_path(hf_ckpt_path: Path) -> Path:
+    if not hf_ckpt_path.exists():
+        raise FileNotFoundError(
+            f"HuggingFace checkpoint path does not exist: {hf_ckpt_path}"
+        )
+
+    if hf_ckpt_path.is_file():
+        if hf_ckpt_path.suffix.lower() not in SUPPORTED_CHECKPOINT_SUFFIXES:
+            raise ValueError(
+                "SAM3 only supports torch checkpoint files with suffix "
+                f"{sorted(SUPPORTED_CHECKPOINT_SUFFIXES)}: {hf_ckpt_path}"
+            )
+        return hf_ckpt_path
+
+    preferred_filenames = ("sam3.pt", "checkpoint.pt", "pytorch_model.bin")
+    for filename in preferred_filenames:
+        candidate = hf_ckpt_path / filename
+        if candidate.is_file():
+            return candidate
+
+    for pattern in ("*.pt", "*.pth", "*.bin"):
+        matches = sorted(hf_ckpt_path.glob(pattern))
+        if matches:
+            return matches[0]
+
+    raise FileNotFoundError(
+        "No torch checkpoint file was found under HuggingFace checkpoint directory: "
+        f"{hf_ckpt_path}"
+    )
+
+
 def build_model(
     device: torch.device,
-    checkpoint_path: Path | None = None,
-    load_from_hf: bool = False,
+    hf_ckpt_path: Path,
     compile_model: bool = False,
 ):
     return build_sam3_image_model(
         bpe_path=resolve_bpe_path(),
         device=str(device),
-        checkpoint_path=str(checkpoint_path) if checkpoint_path else None,
-        load_from_HF=load_from_hf,
+        checkpoint_path=str(resolve_hf_checkpoint_path(hf_ckpt_path)),
+        load_from_HF=False,
         compile=compile_model,
     )
 
@@ -264,7 +365,6 @@ def infer_text_prompt_batch_for_single_image(
     postprocessor: PostProcessImage,
     device: torch.device,
     query_id_counter,
-    text_prompt_template: str,
 ) -> list[dict]:
     datapoint = create_empty_datapoint()
     set_image(datapoint, image.copy())
@@ -272,7 +372,7 @@ def infer_text_prompt_batch_for_single_image(
     query_id_to_class_name: dict[int, str] = {}
     for class_name in class_names:
         query_id = next(query_id_counter)
-        query_text = build_text_prompt(class_name, text_prompt_template)
+        query_text = class_name # build_text_prompt(class_name, text_prompt_template)
         add_text_prompt(datapoint, query_text, query_id)
         query_id_to_class_name[query_id] = class_name
 
@@ -314,14 +414,31 @@ def resolve_output_json_path(
     return output_dir / f"{image_path.stem}.json"
 
 
+def resolve_image_file_field(image_path: Path, input_path: Path) -> str:
+    try:
+        naip_relative_path = image_path.relative_to(NAIP_IMAGE_ROOT)
+    except ValueError:
+        naip_relative_path = None
+
+    if naip_relative_path is not None:
+        relative_parts = [part for part in naip_relative_path.parts if part != "tci"]
+        return Path(*relative_parts).as_posix()
+
+    if input_path.is_dir():
+        return image_path.relative_to(input_path).as_posix()
+
+    return image_path.name
+
+
 def save_inference_result(
     image_path: Path,
+    input_path: Path,
     annotations: Sequence[dict],
     output_json_path: Path,
 ) -> None:
     output_json_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
-        "image_file": image_path.name,
+        "image_file": resolve_image_file_field(image_path, input_path),
         "annotation": list(annotations),
     }
     with output_json_path.open("w", encoding="utf-8") as f:
@@ -339,7 +456,6 @@ def run_inference_for_single_image(
     postprocessor: PostProcessImage,
     device: torch.device,
     query_id_counter,
-    text_prompt_template: str,
 ) -> Path:
     with Image.open(image_path) as pil_image:
         image = pil_image.convert("RGB")
@@ -354,38 +470,12 @@ def run_inference_for_single_image(
             postprocessor=postprocessor,
             device=device,
             query_id_counter=query_id_counter,
-            text_prompt_template=text_prompt_template,
         )
         all_annotations.extend(batch_annotations)
 
     output_json_path = resolve_output_json_path(image_path, input_path, output_dir)
-    save_inference_result(image_path, all_annotations, output_json_path)
+    save_inference_result(image_path, input_path, all_annotations, output_json_path)
     return output_json_path
-
-# dataloader
-import webdataset as wds
-from torch.utils.data import DataLoader, Dataset
-def get_wds_loader(train_dir):
-    def byte_decode(x):
-        return x.decode("utf-8")
-    
-    train_url = os.path.join(train_dir, "{pub11,rs3}-train-{0000..0031}.tar")
-
-    def my_decoder(key, value):
-        if key.endswith(".img_content"):
-            assert isinstance(value, bytes)
-            value = Image.open(io.BytesIO(value))
-            value = preproc(value)
-        elif key.endswith(".img_name") or key.endswith(".caption"):
-            value = byte_decode(value)
-        return value
-
-    train_dataset = wds.WebDataset(train_url).decode(my_decoder)
-    train_dataloader = DataLoader(train_dataset, num_workers=1, batch_size=1)
-
-    return train_dataloader
-
-
 
 
 def parse_args() -> argparse.Namespace:
@@ -412,15 +502,10 @@ def parse_args() -> argparse.Namespace:
         help="Category json files used to build candidate_geospatial_entity_category_list.",
     )
     parser.add_argument(
-        "--checkpoint-path",
+        "--hf-ckpt-path",
         type=Path,
-        default=None,
-        help="Local SAM3 checkpoint path.",
-    )
-    parser.add_argument(
-        "--load-from-hf",
-        action="store_true",
-        help="Allow SAM3 to download pretrained weights from HuggingFace if no checkpoint is provided.",
+        required=True,
+        help="Local HuggingFace SAM3 checkpoint directory or checkpoint file path.",
     )
     parser.add_argument(
         "--batch-size",
@@ -448,20 +533,9 @@ def parse_args() -> argparse.Namespace:
         help="Detection score threshold used in SAM3 post-processing.",
     )
     parser.add_argument(
-        "--text-prompt-template",
-        type=str,
-        default="{class_name}",
-        help="Prompt template. Example: 'a satellite image of {class_name}'.",
-    )
-    parser.add_argument(
         "--compile-model",
         action="store_true",
         help="Enable torch compile when building SAM3.",
-    )
-    parser.add_argument(
-        "--rs5m",
-        action="store_true",
-        help="RS5M webdataset train dir",
     )
     return parser.parse_args()
 
@@ -473,15 +547,7 @@ def validate_args(args: argparse.Namespace) -> None:
     if args.device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA is not available, but --device=cuda was requested")
 
-    if args.checkpoint_path is not None and not args.checkpoint_path.exists():
-        raise FileNotFoundError(
-            f"Checkpoint path does not exist: {args.checkpoint_path}"
-        )
-
-    if args.checkpoint_path is None and not args.load_from_hf:
-        raise ValueError(
-            "Please provide --checkpoint-path, or use --load-from-hf explicitly"
-        )
+    resolve_hf_checkpoint_path(args.hf_ckpt_path)
 
 
 def main() -> None:
@@ -493,38 +559,41 @@ def main() -> None:
         raise ValueError("No candidate geospatial entity categories were loaded")
 
     device = torch.device(args.device)
-    model = build_model(
-        device=device,
-        checkpoint_path=args.checkpoint_path,
-        load_from_hf=args.load_from_hf,
-        compile_model=args.compile_model,
-    )
-    transform = build_transform(args.image_size)
-    postprocessor = build_postprocessor(
-        device=device,
-        detection_threshold=args.detection_threshold,
-    )
-
-    image_paths = list(iter_image_files(args.input_path))
-    if not image_paths:
-        raise FileNotFoundError(f"No images found under: {args.input_path}")
-
-    query_id_counter = count(1)
-    for image_path in image_paths:
-        output_json_path = run_inference_for_single_image(
-            image_path=image_path,
-            input_path=args.input_path,
-            output_dir=args.output_dir,
-            class_names=class_names,
-            batch_size=args.batch_size,
-            model=model,
-            transform=transform,
-            postprocessor=postprocessor,
+    with build_inference_context(device):
+        model = build_model(
             device=device,
-            query_id_counter=query_id_counter,
-            text_prompt_template=args.text_prompt_template,
+            hf_ckpt_path=args.hf_ckpt_path,
+            compile_model=args.compile_model,
         )
-        print(f"Saved inference result to: {output_json_path}")
+        transform = build_transform(args.image_size)
+        postprocessor = build_postprocessor(
+            device=device,
+            detection_threshold=args.detection_threshold,
+        )
+
+        image_paths = resolve_image_paths(args.input_path)
+        if not image_paths:
+            raise FileNotFoundError(f"No images found under: {args.input_path}")
+
+        query_id_counter = count(1)
+        progress_bar = tqdm(
+            image_paths,
+            desc="SAM3 inference",
+            unit="image",
+        )
+        for image_path in progress_bar:
+            run_inference_for_single_image(
+                image_path=image_path,
+                input_path=args.input_path,
+                output_dir=args.output_dir,
+                class_names=class_names,
+                batch_size=args.batch_size,
+                model=model,
+                transform=transform,
+                postprocessor=postprocessor,
+                device=device,
+                query_id_counter=query_id_counter,
+            )
 
 
 if __name__ == "__main__":
